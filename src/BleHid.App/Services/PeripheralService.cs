@@ -300,8 +300,10 @@ public sealed class PeripheralService : INotifyPropertyChanged
         {
             try
             {
-                await CaptureSession.RunAsync(peripheral, Append, verbose: false, () => PointerIntervalMs,
-                    stopEndsSession: true, token);
+                await CaptureSession.RunAsync(peripheral, Append,
+                    verbose: AppSettings.Instance.LogKeyDiagnostics,
+                    mouseIntervalMs: () => PointerIntervalMs,
+                    stopEndsSession: true, cancellationToken: token);
             }
             catch (Exception ex)
             {

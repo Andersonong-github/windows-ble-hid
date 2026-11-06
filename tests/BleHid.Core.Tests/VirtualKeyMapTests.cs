@@ -57,6 +57,59 @@ public class VirtualKeyMapTests
         Assert.Equal(nine + 1, zero);
     }
 
+    /// <summary>
+    /// The reported failure: U and O intermittently produced nothing on the Android host while
+    /// neighbouring letters worked. Every letter must map on its own, not just the ones the
+    /// older spot checks happened to cover.
+    /// </summary>
+    [Fact]
+    public void Every_letter_a_through_z_maps_to_its_own_usage()
+    {
+        for (var i = 0; i < 26; i++)
+        {
+            Assert.True(VirtualKeyMap.TryGetUsage(0x41 + i, out var usage), $"VK 0x{0x41 + i:X2} did not map");
+            Assert.Equal(0x04 + i, usage);
+        }
+    }
+
+    [Theory]
+    [InlineData(0x16, 0x18)] // U
+    [InlineData(0x18, 0x12)] // O
+    [InlineData(0x1E, 0x04)] // A
+    [InlineData(0x32, 0x10)] // M
+    [InlineData(0x0B, 0x27)] // 0
+    public void Unresolved_virtual_keys_fall_back_to_the_scan_code(uint scanCode, byte expected)
+    {
+        // VK_PROCESSKEY is what an active IME can hand a low-level hook; VK 0 shows up on some
+        // injection paths. Either way the physical key is still identifiable.
+        Assert.True(VirtualKeyMap.TryGetUsage(0xE5, scanCode, false, out var processKeyUsage));
+        Assert.Equal(expected, processKeyUsage);
+        Assert.True(VirtualKeyMap.TryGetUsage(0x00, scanCode, false, out var zeroUsage));
+        Assert.Equal(expected, zeroUsage);
+    }
+
+    [Fact]
+    public void A_resolved_virtual_key_still_wins_over_its_scan_code()
+    {
+        // Scan code 0x16 is the physical U key. A real VK_A must not be turned into U just
+        // because a layout happens to put A on that position.
+        Assert.True(VirtualKeyMap.TryGetUsage(0x41, 0x16, false, out var usage));
+        Assert.Equal(0x04, usage);
+    }
+
+    [Fact]
+    public void Every_scan_code_fallback_usage_is_within_the_declared_logical_range()
+    {
+        for (uint scanCode = 0; scanCode <= 0x7F; scanCode++)
+        {
+            foreach (var extended in new[] { false, true })
+            {
+                if (!VirtualKeyMap.TryGetScanCodeUsage(scanCode, extended, out var usage)) continue;
+                Assert.InRange(usage, (byte)1, (byte)101);
+            }
+        }
+    }
+
     [Fact]
     public void Distinct_virtual_keys_never_share_a_usage()
     {

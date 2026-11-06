@@ -58,10 +58,33 @@
           <ui:TextBlock Text="Shake the pointer to switch target" FontTypography="BodyStrong" />
           <ui:TextBlock FontTypography="Caption" TextWrapping="Wrap"
                         Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                        Text="Move the mouse rapidly back and forth to cycle between this PC and the paired hosts. Ctrl+Alt+CapsLock always works too." />
+                        Text="Move the mouse rapidly back and forth to cycle between this PC and the paired hosts. The hotkeys below always work too, and the touchpad is left untouched while input stays local." />
         </StackPanel>
       </ui:CardControl.Header>
       <ui:ToggleSwitch x:Name="SwitchGestureToggle" Click="OnSwitchGestureChanged" />
+    </ui:CardControl>
+
+    <ui:CardControl Icon="{ui:SymbolIcon Keyboard24}" Margin="0,0,0,8">
+      <ui:CardControl.Header>
+        <StackPanel>
+          <ui:TextBlock Text="Switch targets from the keyboard" FontTypography="BodyStrong" />
+          <ui:TextBlock FontTypography="Caption" TextWrapping="Wrap" Margin="0,4,0,0"
+                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                        Text="Ctrl+Alt+CapsLock cycles through this PC and the paired hosts. Ctrl+Alt+1…9 selects a host directly, Ctrl+Alt+0 returns here, and Ctrl+Alt+Q stops capture. Ctrl+D+C still cycles as an alternative." />
+        </StackPanel>
+      </ui:CardControl.Header>
+    </ui:CardControl>
+
+    <ui:CardControl Icon="{ui:SymbolIcon Bug24}" Margin="0,0,0,8">
+      <ui:CardControl.Header>
+        <StackPanel>
+          <ui:TextBlock Text="Log every captured key" FontTypography="BodyStrong" />
+          <ui:TextBlock FontTypography="Caption" TextWrapping="Wrap"
+                        Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                        Text="Writes each key's virtual key, scan code and resulting HID usages to the activity log. Leave this off unless you are diagnosing a key that does not arrive on the host." />
+        </StackPanel>
+      </ui:CardControl.Header>
+      <ui:ToggleSwitch IsChecked="{Binding LogKeyDiagnostics, Mode=TwoWay}" />
     </ui:CardControl>
 
     <ui:CardControl Icon="{ui:SymbolIcon ArrowExit20}">

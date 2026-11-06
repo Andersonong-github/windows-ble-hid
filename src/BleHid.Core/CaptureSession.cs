@@ -9,11 +9,12 @@ namespace BleHid.Core;
 /// </summary>
 public static class CaptureSession
 {
-    internal enum Queued { Report, MouseReport, SwitchHost, GoLocal }
+    internal enum Queued { Report, MouseReport, SwitchHost, GoLocal, SelectHost }
 
     internal readonly record struct InputReport(Queued Kind,
         KeyModifiers Modifiers = KeyModifiers.None, byte[]? Usages = null,
-        MouseButtons Buttons = MouseButtons.None, int Dx = 0, int Dy = 0, int Wheel = 0);
+        MouseButtons Buttons = MouseButtons.None, int Dx = 0, int Dy = 0, int Wheel = 0,
+        int HostIndex = -1);
 
     internal sealed class ReportQueue
     {
@@ -39,7 +40,7 @@ public static class CaptureSession
             }
         }
 
-        public void EnqueueTargetChange(Queued kind)
+        public void EnqueueTargetChange(Queued kind, int hostIndex = -1)
         {
             lock (_mouseLock)
             {
@@ -48,7 +49,7 @@ public static class CaptureSession
                     _ordered.Enqueue(mouse);
                     _pendingMouse = null;
                 }
-                _ordered.Enqueue(new(kind));
+                _ordered.Enqueue(new(kind, HostIndex: hostIndex));
             }
         }
 
@@ -160,7 +161,7 @@ public static class CaptureSession
                             continue;
                         }
 
-                        if (key.Kind is Queued.SwitchHost or Queued.GoLocal)
+                        if (key.Kind is Queued.SwitchHost or Queued.GoLocal or Queued.SelectHost)
                         {
                             // Read before the target moves: this is the host we are leaving, and
                             // a lock left on there is invisible once we stop sending to it.
@@ -168,9 +169,19 @@ public static class CaptureSession
                             var leftLocks = peripheral.TargetLockWarning;
 
                             await peripheral.RefreshHostNamesAsync();
-                            var target = key.Kind == Queued.GoLocal
-                                ? peripheral.SelectLocal()
-                                : peripheral.SelectNextHost();
+
+                            if (key.Kind == Queued.SelectHost && !peripheral.SelectHost(key.HostIndex))
+                            {
+                                log($"  [host] no host at position {key.HostIndex + 1}");
+                                continue;
+                            }
+
+                            var target = key.Kind switch
+                            {
+                                Queued.GoLocal => peripheral.SelectLocal(),
+                                Queued.SelectHost => peripheral.SelectedHostDisplay,
+                                _ => peripheral.SelectNextHost()
+                            };
                             capture.SetPassThrough(peripheral.IsLocalTarget);
 
                             var locks = peripheral.TargetLockWarning;
@@ -234,6 +245,16 @@ public static class CaptureSession
             reports.EnqueueTargetChange(Queued.SwitchHost);
             Wake();
         };
+        capture.SelectHostRequested += index =>
+        {
+            reports.EnqueueTargetChange(Queued.SelectHost, index);
+            Wake();
+        };
+        capture.SelectLocalRequested += () =>
+        {
+            reports.EnqueueTargetChange(Queued.GoLocal);
+            Wake();
+        };
         capture.StopRequested += () =>
         {
             if (stopEndsSession)
@@ -260,7 +281,7 @@ public static class CaptureSession
         {
             log($"  pointer report interval: {PointerIntervalMs()} ms");
             log($"  sending to: {peripheral.SelectedHostDisplay}");
-            log("  Ctrl+Alt+CapsLock or Ctrl+D+C switches target.");
+            log("  Ctrl+Alt+CapsLock or Ctrl+D+C cycles target, Ctrl+Alt+1..9 picks a host, Ctrl+Alt+0 returns here.");
             log(stopEndsSession
                 ? "  capturing - Ctrl+Alt+Q stops."
                 : "  capturing - Ctrl+Alt+Q returns input to this PC.");

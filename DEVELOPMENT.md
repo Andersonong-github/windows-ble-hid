@@ -219,6 +219,47 @@ Num Lock itself, and the keypad operators, are unambiguous by virtual key and st
 virtual-key map. The virtual-key map also remains the fallback for injected input, which can
 arrive with no scan code.
 
+`VirtualKeyMap.TryGetUsage(vk, scanCode, extended)` uses the virtual key normally, but falls
+back to the scan code when Windows hands over `VK_PROCESSKEY` (`0xE5`, seen with an active IME)
+or `0`. Without that fallback those events are simply dropped, which the host sees as a key
+that does nothing. The fallback covers the US Scan Code Set 1 main block, F-keys, the
+navigation cluster and the keypad. GUI keys deliberately stay modifiers because the six-slot
+array's declared logical maximum is 101.
+
+## Keyboard state is ordered and self-healing
+
+Three properties matter for a HID keyboard, and the original `HashSet<byte>` had none of them:
+
+1. **One entry per usage, in press order.** `_held` is a list of `(usage, virtualKey)`.
+   `Take(6)` over a set was arbitrary; a stale entry could therefore occupy a slot forever.
+2. **The newest key wins the sixth slot.** A report cannot describe more than six usages, so
+   when more are held the six most recently pressed are sent and older ones are omitted. The
+   key the user just pressed is never the one that disappears.
+3. **Lost key-ups are recovered.** A 250 ms timer posts a message to the hook thread, which
+   re-checks every held key with `GetAsyncKeyState`. A key-up lost to hook re-arming, a
+   target change or a stalled input thread is removed and a corrected report is sent. Stuck
+   modifiers are cleared the same way: a stuck Ctrl silently turns every later letter into a
+   shortcut, which is indistinguishable from "those keys do not work".
+
+The timer only posts; all state stays on the hook thread, so no locking is needed and the
+event handler cannot race the resync.
+
+Windows auto-repeat key-downs are swallowed. A real HID keyboard sends a report only when the
+key set changes; hosts implement typematic repeat themselves. Forwarding the repeats wasted
+link time on Android and could double characters on hosts that repeat on every report.
+
+## Mouse hook lifetime and Precision Touchpad
+
+`WH_MOUSE_LL` exists only to swallow pointer input while it is being forwarded. It is installed
+on capture and **removed** as soon as the target becomes this PC (`OnPassThroughChanged`). The
+earlier code kept it installed and passed events through, which left Windows Precision Touchpad
+gestures — two-finger scroll on a Surface in particular — broken after returning from Android.
+
+Shake-to-switch does not need the hook while input is local: a 16 ms timer samples
+`GetCursorPos` on the hook thread and feeds the same detector with differenced deltas. When a
+mouse button is held, it is released before the target changes, and the hook thread releases a
+still-held button when the session stops.
+
 ## Android provider-restart reconnect root cause
 
 ### Executive summary

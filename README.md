@@ -101,7 +101,9 @@ The same shortcuts work in the desktop app and interactive CLI:
 | While capturing | |
 | --- | --- |
 | `Ctrl` + `Alt` + `Q` | Stop and return control to this PC |
-| `Ctrl` + `Alt` + `CapsLock` or `Ctrl` + `D` + `C` | Switch which device you are driving, including back to this PC |
+| `Ctrl` + `Alt` + `CapsLock` or `Ctrl` + `D` + `C` | Cycle: this PC → host 1 → … → host N → this PC |
+| `Ctrl` + `Alt` + `1` … `9` | Jump straight to host 1–9 without cycling |
+| `Ctrl` + `Alt` + `0` | Return input to this PC immediately |
 
 The CLI also offers scripted input (`type`, `move`) and diagnostics.
 
@@ -196,6 +198,8 @@ pick a host. From there it is hotkeys only — there is no console to type into:
 | Hotkey | Action |
 | --- | --- |
 | `Ctrl` + `Alt` + `CapsLock` or `Ctrl` + `D` + `C` | Switch target: this PC → host 1 → … → host N → this PC |
+| `Ctrl` + `Alt` + `1` … `9` | Select host 1–9 directly, in the same order as the app's target list |
+| `Ctrl` + `Alt` + `0` | Return input to this PC |
 | `Ctrl` + `Alt` + `Q` | Return input to this PC (does **not** exit — use `--stop`) |
 
 If the selected host disconnects, capture automatically returns input to this PC instead
@@ -282,10 +286,16 @@ notification-area menu, or type `quit` in the CLI, before rebuilding to avoid `M
 | Hotkey | Action |
 | --- | --- |
 | `Ctrl` + `Alt` + `CapsLock` or `Ctrl` + `D` + `C` | Switch target: this PC → host 1 → … → host N → this PC |
+| `Ctrl` + `Alt` + `1` … `9` | Select host 1–9 directly, without cycling through the others |
+| `Ctrl` + `Alt` + `0` | Return input to this PC |
 | `Ctrl` + `Alt` + `Q` | Stop capturing |
 
 When the target is **this PC**, input passes through untouched so you can use your own
 machine normally. The hotkeys stay live in that mode.
+
+Direct selection uses the same ordering as the target list in the desktop app. If the
+numbered host is not currently subscribed, the command is logged and the target does not
+change, so it cannot silently send input to the wrong device.
 
 `Ctrl` + `Alt` + `CapsLock` cycles once per Caps Lock press without toggling Caps Lock
 locally or on the host. Ordinary Caps Lock presses are unchanged.
@@ -317,6 +327,14 @@ positives: ordinary pointer movement never reaches that speed. Out-of-range valu
 clamped and the clamping is logged.
 
 The gesture is a convenience; the hotkeys above remain the guaranteed way to switch.
+
+### Touchpad and pointer capture
+
+The low-level mouse hook exists only while input is being sent to a host. As soon as the
+target is **this PC** the hook is removed, so Windows Precision Touchpad gestures —
+two-finger scroll in particular — return to their normal path. Shake-to-switch does not
+need the hook in that mode: the pointer is sampled instead. This also means a Surface
+touchpad cannot be left in a half-finished gesture after a round trip to Android.
 
 ### Lock key state
 

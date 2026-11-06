@@ -27,7 +27,20 @@ public sealed class InputCapture : IDisposable
     private const int WM_MBUTTONDOWN = 0x0207, WM_MBUTTONUP = 0x0208;
     private const int WM_MOUSEWHEEL = 0x020A;
 
-    private readonly HashSet<byte> _pressedUsages = [];
+    // Private messages used to keep every piece of input state on the hook thread. Timers and
+    // setting changes only post these; the message loop applies them.
+    private const int WM_APP_SYNC_HOOKS = 0x8001;
+    private const int WM_APP_RESYNC_KEYS = 0x8002;
+    private const int WM_APP_POLL_GESTURE = 0x8003;
+
+    private const int ResyncIntervalMs = 250;
+    private const int GesturePollIntervalMs = 16;
+
+    // Ordered oldest -> newest, with one entry per HID usage. A real keyboard reports the keys
+    // that are down and the host derives presses from the changes, so ordering and identity
+    // both matter. A set gave neither: its order was arbitrary and stale entries could hold
+    // every one of the six report slots, silently dropping newly pressed keys.
+    private readonly List<HeldKey> _held = [];
     private readonly HashSet<int> _pressedVirtualKeys = [];
     private readonly HashSet<int> _localPressedVirtualKeys = [];
     private LowLevelProc? _keyboardProc;
@@ -36,6 +49,10 @@ public sealed class InputCapture : IDisposable
     private IntPtr _keyboardHook, _mouseHook, _winEventHook;
     private Thread? _thread;
     private uint _threadId;
+    private Timer? _resyncTimer;
+    private Timer? _gesturePollTimer;
+    private int _gesturePollPending;
+    private int _hostSelectLatched = -1;
     private MouseButtons _buttons;
     private MouseButtons _localButtons;
     private int _centerX, _centerY;
@@ -53,9 +70,22 @@ public sealed class InputCapture : IDisposable
     private bool _haveLocalPoint;
     private Func<int> _now = () => Environment.TickCount;
 
+    // Test hook: how the resync pass asks whether a key is still physically down. Real input
+    // uses the asynchronous key state; tests replace it with a table.
+    private Func<int, bool> _isKeyDown = static vk => (GetAsyncKeyState(vk) & 0x8000) != 0;
+
+    internal readonly record struct HeldKey(byte Usage, int VirtualKey);
+
     public event Action<KeyModifiers, byte[]>? KeyboardReport;
     public event Action<MouseButtons, int, int, int>? MouseReport;
     public event Action? SwitchHostRequested;
+
+    /// <summary>Zero-based host index requested with Ctrl+Alt+1..9.</summary>
+    public event Action<int>? SelectHostRequested;
+
+    /// <summary>Ctrl+Alt+0: hand input back to this PC without ending the session.</summary>
+    public event Action? SelectLocalRequested;
+
     public event Action? StopRequested;
     public event Action<string>? Log;
 
@@ -74,6 +104,8 @@ public sealed class InputCapture : IDisposable
         // being performed, and local deltas need a fresh reference point either way.
         _gesture?.Reset();
         _haveLocalPoint = false;
+        // Hooks have to be installed and removed on the thread that owns them.
+        PostHookMessage(WM_APP_SYNC_HOOKS);
     }
 
     /// <summary>
@@ -88,6 +120,9 @@ public sealed class InputCapture : IDisposable
 
     /// <summary>Test hook: replaces the wall clock used by the switch gesture.</summary>
     internal void SetNow(Func<int> now) => _now = now;
+
+    /// <summary>Test hook: replaces the physical key-state probe used by the resync pass.</summary>
+    internal void SetKeyStateProbe(Func<int, bool> probe) => _isKeyDown = probe;
 
     /// <summary>Logs every hook event and report; useful only for diagnosing delivery problems.</summary>
     public bool Verbose { get; init; }
@@ -157,10 +192,26 @@ public sealed class InputCapture : IDisposable
         var module = GetModuleHandle(null);
         _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, module, 0);
         var keyboardError = Marshal.GetLastWin32Error();
-        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, module, 0);
-        var mouseError = Marshal.GetLastWin32Error();
+        // The mouse hook exists only to capture and swallow pointer input. In pass-through it
+        // is deliberately absent: leaving it installed is what broke Precision Touchpad
+        // gestures (notably two-finger scroll) after returning from a remote host.
+        if (!_passThrough) _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, module, 0);
+        var mouseError = _mouseHook != IntPtr.Zero ? 0 : Marshal.GetLastWin32Error();
 
-        Log?.Invoke($"  [hook] keyboard=0x{_keyboardHook:x} (err {keyboardError}), mouse=0x{_mouseHook:x} (err {mouseError}), screen={GetSystemMetrics(0)}x{GetSystemMetrics(1)}, center={_centerX},{_centerY}");
+        Log?.Invoke($"  [hook] keyboard=0x{_keyboardHook:x} (err {keyboardError}), mouse={(_passThrough ? "off (local pass-through)" : $"0x{_mouseHook:x} (err {mouseError})")}, screen={GetSystemMetrics(0)}x{GetSystemMetrics(1)}, center={_centerX},{_centerY}");
+
+        // A key-up can be lost when the hooks are re-armed or the target changes. Without a
+        // resync the usage stays in the report forever and the host keeps that key down, which
+        // in turn makes the next press of it look like a no-op. The timer only posts a message
+        // so all state stays on this thread.
+        _resyncTimer = new Timer(_ => PostHookMessage(WM_APP_RESYNC_KEYS),
+            null, ResyncIntervalMs, ResyncIntervalMs);
+        // Pointer polling keeps the shake gesture alive in pass-through without a mouse hook.
+        // Only one poll may be outstanding so a busy loop cannot build a message backlog.
+        _gesturePollTimer = new Timer(_ =>
+        {
+            if (Interlocked.Exchange(ref _gesturePollPending, 1) == 0) PostHookMessage(WM_APP_POLL_GESTURE);
+        }, null, GesturePollIntervalMs, GesturePollIntervalMs);
 
         // Hook chains run newest-first, so apps that grab input (Windows App / mstsc, some games)
         // win simply by hooking after us. Re-installing on focus change puts us back in front.
@@ -171,12 +222,42 @@ public sealed class InputCapture : IDisposable
         int result;
         while ((result = GetMessage(out var message, IntPtr.Zero, 0, 0)) > 0)
         {
+            // Thread messages have no window, so DispatchMessage would drop them.
+            if (message.hwnd == IntPtr.Zero)
+            {
+                switch ((int)message.message)
+                {
+                    case WM_APP_SYNC_HOOKS:
+                        OnPassThroughChanged();
+                        continue;
+                    case WM_APP_RESYNC_KEYS:
+                        ResyncHeldState();
+                        continue;
+                    case WM_APP_POLL_GESTURE:
+                        Volatile.Write(ref _gesturePollPending, 0);
+                        PollLocalGesture();
+                        continue;
+                }
+            }
+
             TranslateMessage(ref message);
             DispatchMessage(ref message);
         }
 
         if (Verbose)
             Log?.Invoke($"  [hook] message loop exited ({result}), keyboard events={_keyboardEvents}, mouse events={_mouseEvents}, rearms={_rearms}");
+
+        _resyncTimer?.Dispose();
+        _resyncTimer = null;
+        _gesturePollTimer?.Dispose();
+        _gesturePollTimer = null;
+
+        // A button held when the session stops must not stay pressed on the host.
+        if (_buttons != MouseButtons.None)
+        {
+            _buttons = MouseButtons.None;
+            MouseReport?.Invoke(_buttons, 0, 0, 0);
+        }
 
         if (_winEventHook != IntPtr.Zero) UnhookWinEvent(_winEventHook);
         if (_keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(_keyboardHook);
@@ -262,7 +343,9 @@ public sealed class InputCapture : IDisposable
         if (_keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(_keyboardHook);
         _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc!, module, 0);
         if (_mouseHook != IntPtr.Zero) UnhookWindowsHookEx(_mouseHook);
-        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc!, module, 0);
+        _mouseHook = _passThrough ? IntPtr.Zero : SetWindowsHookEx(WH_MOUSE_LL, _mouseProc!, module, 0);
+        // Any key-up that raced the re-arm is recovered by the resync pass.
+        PostHookMessage(WM_APP_RESYNC_KEYS);
         _rearms++;
 
         if (Verbose)
@@ -312,11 +395,35 @@ public sealed class InputCapture : IDisposable
 
         if (isDown && virtualKey == 0x51 && IsDown(0x11) && IsDown(0x12)) // Ctrl+Alt+Q
         {
-            _pressedUsages.Clear();
             _pressedVirtualKeys.Clear();
-            KeyboardReport?.Invoke(KeyModifiers.None, []);
+            _localPressedVirtualKeys.Clear();
+            // Releases both a held key and a held mouse button, so the host cannot be left
+            // with either stuck down when capture ends.
+            ReleaseHeldKeys();
             StopRequested?.Invoke();
             return true;
+        }
+
+        // Ctrl+Alt+1..9 goes straight to a host; Ctrl+Alt+0 comes back here. Digits are common
+        // in ordinary typing, so the combination is gated on both modifiers and latched per
+        // key so auto-repeat cannot fire it repeatedly.
+        if (IsDown(0x11) && IsDown(0x12) && virtualKey is >= 0x30 and <= 0x39)
+        {
+            if (isDown)
+            {
+                if (_hostSelectLatched != virtualKey)
+                {
+                    _hostSelectLatched = virtualKey;
+                    if (virtualKey == 0x30) RequestLocal();
+                    else RequestHostSelect(virtualKey - 0x31);
+                }
+            }
+            else if (_hostSelectLatched == virtualKey)
+            {
+                _hostSelectLatched = -1;
+            }
+
+            return !releaseLocally;
         }
 
         // Ctrl+D+C switches host. Latched so key auto-repeat cannot cycle past the target.
@@ -340,17 +447,120 @@ public sealed class InputCapture : IDisposable
 
         if (VirtualKeyMap.TryGetUsage(virtualKey, scanCode, extended, out var usage))
         {
-            if (isDown) _pressedUsages.Add(usage);
-            else _pressedUsages.Remove(usage);
+            if (isDown)
+            {
+                if (ContainsHeld(usage))
+                {
+                    // Windows auto-repeats a held key; a real HID keyboard does not. Forwarding
+                    // those repeats wastes link time (and time is exactly what a fast typist on
+                    // a slow Android connection does not have) and some hosts turn them into
+                    // doubled characters.
+                    return true;
+                }
+
+                // VK_PROCESSKEY and VK 0 are not real physical keys, so the resync pass cannot
+                // ask about them. The matching key-up still removes the usage by identity.
+                var identity = virtualKey is 0 or 0xE5 ? 0 : virtualKey;
+                AddHeld(usage, identity);
+            }
+            else
+            {
+                RemoveHeld(usage);
+            }
+        }
+        else if (isDown && Verbose)
+        {
+            Log?.Invoke($"  [key] unmapped vk=0x{virtualKey:x2} scan=0x{scanCode:x2} ext={extended}");
         }
 
+        SendKeyboardReport($"vk=0x{virtualKey:x2} scan=0x{scanCode:x2}{(extended ? " ext" : "")} {(isDown ? "down" : "up")}");
+        return !releaseLocally;
+    }
+
+    private void AddHeld(byte usage, int virtualKey)
+    {
+        // One entry per usage. Re-adding an existing key makes it the newest so the six-slot
+        // report always favours the key the user pressed last.
+        for (var i = 0; i < _held.Count; i++)
+        {
+            if (_held[i].Usage != usage) continue;
+            _held.RemoveAt(i);
+            break;
+        }
+
+        _held.Add(new HeldKey(usage, virtualKey));
+    }
+
+    private bool ContainsHeld(byte usage)
+    {
+        foreach (var key in _held)
+            if (key.Usage == usage) return true;
+        return false;
+    }
+
+    private bool RemoveHeld(byte usage)
+    {
+        for (var i = 0; i < _held.Count; i++)
+        {
+            if (_held[i].Usage != usage) continue;
+            _held.RemoveAt(i);
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// The usages for the six-slot keyboard array. When more than six keys are down the HID
+    /// array cannot describe them all; keeping the newest six means a freshly pressed key is
+    /// never the one that disappears.
+    /// </summary>
+    private byte[] CurrentUsages()
+    {
+        var skip = Math.Max(0, _held.Count - 6);
+        var usages = new byte[_held.Count - skip];
+        for (var i = 0; i < usages.Length; i++) usages[i] = _held[skip + i].Usage;
+        return usages;
+    }
+
+    private void SendKeyboardReport(string origin = "resync")
+    {
         var modifiers = CurrentModifiers();
-        var usages = _pressedUsages.Take(6).ToArray();
-        if (Verbose && _keyboardEvents <= 20)
-            Log?.Invoke($"  [key] vk=0x{virtualKey:x2} {(isDown ? "down" : "up")} -> mod=0x{(byte)modifiers:x2} usages=[{string.Join(" ", usages.Select(u => u.ToString("x2")))}]");
+        var usages = CurrentUsages();
+        if (Verbose && _keyboardEvents <= 500)
+            Log?.Invoke($"  [key] {origin} -> mod=0x{(byte)modifiers:x2} usages=[{string.Join(" ", usages.Select(u => u.ToString("x2")))}]");
 
         KeyboardReport?.Invoke(modifiers, usages);
-        return !releaseLocally;
+    }
+
+    /// <summary>
+    /// Drops keys whose key-up never reached us - a re-armed hook, a target change, a stalled
+    /// input thread. Runs on the hook thread, so it cannot race the event handler.
+    /// </summary>
+    internal void ResyncHeldState()
+    {
+        if (_passThrough) return;
+
+        var changed = false;
+
+        for (var i = _held.Count - 1; i >= 0; i--)
+        {
+            var key = _held[i];
+            if (key.VirtualKey == 0 || _isKeyDown(key.VirtualKey)) continue;
+            _held.RemoveAt(i);
+            changed = true;
+        }
+
+        // Modifiers are tracked by virtual key only, and a stuck modifier silently turns every
+        // later letter into a shortcut - which reads as "those keys stopped working".
+        foreach (var virtualKey in _pressedVirtualKeys.ToArray())
+        {
+            if (virtualKey is not (>= 0xA0 and <= 0xA5 or 0x5B or 0x5C)) continue;
+            if (_isKeyDown(virtualKey)) continue;
+            _pressedVirtualKeys.Remove(virtualKey);
+            changed = true;
+        }
+
+        if (changed) SendKeyboardReport();
     }
 
     private void RequestHostSwitch()
@@ -358,14 +568,31 @@ public sealed class InputCapture : IDisposable
         // Release everything held before the target changes. These reports are queued ahead of
         // the switch, so the outgoing host sees the release instead of being left with a key or
         // a mouse button stuck down.
-        _pressedUsages.Clear();
+        ReleaseHeldKeys();
+        SwitchHostRequested?.Invoke();
+    }
+
+    private void RequestHostSelect(int index)
+    {
+        ReleaseHeldKeys();
+        SelectHostRequested?.Invoke(index);
+    }
+
+    private void RequestLocal()
+    {
+        ReleaseHeldKeys();
+        SelectLocalRequested?.Invoke();
+    }
+
+    private void ReleaseHeldKeys()
+    {
+        _held.Clear();
         KeyboardReport?.Invoke(KeyModifiers.None, []);
         if (_buttons != MouseButtons.None)
         {
             _buttons = MouseButtons.None;
             MouseReport?.Invoke(_buttons, 0, 0, 0);
         }
-        SwitchHostRequested?.Invoke();
     }
 
     /// <summary>
@@ -404,6 +631,60 @@ public sealed class InputCapture : IDisposable
         if (gesture is null || !gesture.Feed(dx, dy, _now())) return;
         if (Verbose) Log?.Invoke("  [gesture] shake detected - switching target");
         RequestHostSwitch();
+    }
+
+    /// <summary>
+    /// Samples the pointer while input is local. The mouse hook is not installed then, so this
+    /// is how a shake can still hand input to a host without touching the touchpad's own path.
+    /// </summary>
+    private void PollLocalGesture()
+    {
+        if (!_running || !_passThrough || _gesture is null) return;
+        if (!GetCursorPos(out var point)) return;
+        TrackLocalGesture(point.x, point.y);
+    }
+
+    /// <summary>
+    /// Applies a pass-through change on the hook thread: the mouse hook is present only while
+    /// input is actually being captured, and leaving capture releases everything first.
+    /// </summary>
+    private void OnPassThroughChanged()
+    {
+        if (!_running) return;
+
+        if (_passThrough)
+        {
+            ReleaseHeldKeys();
+            _pressedVirtualKeys.Clear();
+            _localPressedVirtualKeys.Clear();
+            UninstallMouseHook();
+            _haveLocalPoint = false;
+            return;
+        }
+
+        InstallMouseHook();
+        _haveLocalPoint = false;
+    }
+
+    private void InstallMouseHook()
+    {
+        if (_mouseHook != IntPtr.Zero || _mouseProc is null) return;
+        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, GetModuleHandle(null), 0);
+        if (_mouseHook == IntPtr.Zero)
+            Log?.Invoke($"  [hook] mouse hook install failed (err {Marshal.GetLastWin32Error()})");
+    }
+
+    private void UninstallMouseHook()
+    {
+        if (_mouseHook == IntPtr.Zero) return;
+        UnhookWindowsHookEx(_mouseHook);
+        _mouseHook = IntPtr.Zero;
+    }
+
+    private void PostHookMessage(int message)
+    {
+        var threadId = _threadId;
+        if (threadId != 0) PostThreadMessage(threadId, (uint)message, IntPtr.Zero, IntPtr.Zero);
     }
 
     internal bool HandleMouseButtonEvent(MouseButtons button, bool isDown)
@@ -572,6 +853,12 @@ public sealed class InputCapture : IDisposable
 
     [DllImport("user32.dll")]
     private static extern bool SetCursorPos(int x, int y);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out POINT point);
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int virtualKey);
 
     [DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int nIndex);

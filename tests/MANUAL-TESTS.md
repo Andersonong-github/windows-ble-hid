@@ -42,7 +42,11 @@ is gitignored.
 For each device in the table above:
 
 - [ ] `type hello world` produces the exact text
+- [ ] `type abcdefghijklmnopqrstuvwxyz` produces every letter, including **u** and **o**
+- [ ] Typing the whole alphabet by hand matches what appears on the host
 - [ ] Capitals and digits are correct (`type Hello 123`) — catches usage/modifier mapping
+- [ ] Holding a letter repeats it, but releasing it never leaves it stuck down on the host
+- [ ] Typing quickly for ~30 seconds loses no characters and doubles none
 - [ ] `key enter`, `key esc`, `key f5` behave as named
 - [ ] `move 100 0` / `move 0 100` move the pointer in the expected direction
 - [ ] `click l`, `click r`, `click m` register
@@ -81,8 +85,14 @@ Needs a host that reports lock keys. Android 16 is the only confirmed one.
 - [ ] `Ctrl+D+C` switches to the next host; the switch is visible in the log
 - [ ] `Ctrl+Alt+CapsLock` cycles the same targets without toggling Caps Lock on either device
 - [ ] Holding Caps Lock in the new chord cycles only once; releasing and pressing it cycles again
+- [ ] `Ctrl+Alt+1` … `Ctrl+Alt+9` select hosts 1–9 directly, in the same order as the UI list
+- [ ] Holding a number in the chord selects only once
+- [ ] `Ctrl+Alt+0` returns input to this PC without ending the session
+- [ ] `Ctrl+Alt+<number>` for a host that is not subscribed logs a message and leaves the target unchanged
+- [ ] Typing a digit without both modifiers still types the digit on the host
 - [ ] `Ctrl+Alt+Q` ends the session and returns input to the PC
 - [ ] After `Ctrl+Alt+Q`, the local keyboard works normally again
+- [ ] Returning to this PC removes the low-level mouse hook — see the touchpad check below
 
 ## 3a. Shake to switch
 
@@ -106,6 +116,18 @@ Off by default. Turn it on with `gesture on` or the Settings toggle.
 - [ ] Out-of-range values are clamped and the clamping is logged
 - [ ] With the gesture off, shaking does nothing
 
+## 3b. Precision touchpad after a round trip
+
+The regression reported on a Surface Pro 4: two-finger scroll stopped working after input had
+been sent to Android and returned to this PC.
+
+- [ ] Two-finger scroll works locally before capture starts
+- [ ] Two-finger scroll on the touchpad scrolls the **host** while capturing (wheel reaches Android)
+- [ ] After `Ctrl+Alt+0` (or `Ctrl+Alt+Q`), two-finger scroll works locally again
+- [ ] After switching to a host and back several times, it still works
+- [ ] Three-finger and four-finger gestures also still work after returning
+- [ ] With shake-to-switch enabled, the touchpad still works locally (gesture uses pointer sampling)
+
 ## 4. Capture mode (UI)
 
 - [ ] Start/Stop capture buttons follow the actual session state
@@ -128,6 +150,9 @@ Measured on Android, historically the worst case.
 - [ ] Pointer movement is smooth, not stepped
 - [ ] Sustained typing does not degrade over ~30 seconds
 - [ ] `capture verbose` shows no growing per-report send time
+- [ ] The UI's **Log every captured key** switch produces `[key] vk=… scan=… -> usages=[…]`
+      lines in the activity log, and turning it off stops them
+- [ ] While a key is held, the log shows one down report, not one per typematic repeat
 
 ## 6. Tray and residency
 

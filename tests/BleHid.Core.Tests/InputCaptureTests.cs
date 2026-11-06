@@ -473,6 +473,188 @@ public sealed class InputCaptureTests
         Assert.Equal(20, incoming.Dx);
     }
 
+    [Fact]
+    public void U_and_o_survive_a_normal_press_and_release()
+    {
+        using var capture = new InputCapture();
+        capture.SetPassThrough(false);
+        var reports = new List<byte[]>();
+        capture.KeyboardReport += (_, usages) => reports.Add(usages);
+
+        capture.HandleKeyboardEvent(0x55, true, 0x16); // U
+        Assert.Equal(new byte[] { 0x18 }, reports[^1]);
+
+        capture.HandleKeyboardEvent(0x4F, true, 0x18); // O
+        Assert.Equal(new byte[] { 0x18, 0x12 }, reports[^1]);
+
+        capture.HandleKeyboardEvent(0x55, false, 0x16);
+        Assert.Equal(new byte[] { 0x12 }, reports[^1]);
+
+        capture.HandleKeyboardEvent(0x4F, false, 0x18);
+        Assert.Empty(reports[^1]);
+    }
+
+    [Fact]
+    public void An_ime_consumed_letter_still_reaches_the_host()
+    {
+        using var capture = new InputCapture();
+        capture.SetPassThrough(false);
+        var reports = new List<byte[]>();
+        capture.KeyboardReport += (_, usages) => reports.Add(usages);
+
+        // VK_PROCESSKEY plus the physical scan code for O.
+        capture.HandleKeyboardEvent(0xE5, true, 0x18);
+        Assert.Equal(new byte[] { 0x12 }, reports[^1]);
+
+        capture.HandleKeyboardEvent(0xE5, false, 0x18);
+        Assert.Empty(reports[^1]);
+    }
+
+    [Fact]
+    public void Auto_repeat_does_not_resend_an_unchanged_report()
+    {
+        using var capture = new InputCapture();
+        capture.SetPassThrough(false);
+        var reports = 0;
+        capture.KeyboardReport += (_, _) => reports++;
+
+        Assert.True(capture.HandleKeyboardEvent(0x41, true));
+        Assert.True(capture.HandleKeyboardEvent(0x41, true));
+        Assert.True(capture.HandleKeyboardEvent(0x41, true));
+
+        Assert.Equal(1, reports);
+    }
+
+    [Fact]
+    public void The_newest_six_keys_win_when_more_than_six_are_held()
+    {
+        using var capture = new InputCapture();
+        capture.SetPassThrough(false);
+        byte[] last = [];
+        capture.KeyboardReport += (_, usages) => last = usages;
+
+        // A..G, usages 0x04..0x0A.
+        for (var i = 0; i < 7; i++) capture.HandleKeyboardEvent(0x41 + i, true);
+        Assert.Equal(new byte[] { 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A }, last);
+
+        // Releasing B makes room and brings the still-held A back into the report.
+        capture.HandleKeyboardEvent(0x42, false);
+        Assert.Contains((byte)0x04, last);
+        Assert.DoesNotContain((byte)0x05, last);
+        Assert.Equal(6, last.Length);
+    }
+
+    [Fact]
+    public void A_lost_key_up_is_recovered_without_losing_the_next_press()
+    {
+        using var capture = new InputCapture();
+        capture.SetPassThrough(false);
+        var reports = new List<byte[]>();
+        capture.KeyboardReport += (_, usages) => reports.Add(usages);
+
+        capture.HandleKeyboardEvent(0x55, true, 0x16); // U down
+        Assert.Equal(new byte[] { 0x18 }, reports[^1]);
+
+        // The key-up never arrived, but the physical key is already released.
+        capture.SetKeyStateProbe(_ => false);
+        capture.ResyncHeldState();
+        Assert.Empty(reports[^1]);
+
+        // A host still holding U would ignore the next identical report; it must be a press.
+        capture.HandleKeyboardEvent(0x55, true, 0x16);
+        Assert.Equal(new byte[] { 0x18 }, reports[^1]);
+    }
+
+    [Fact]
+    public void A_stuck_modifier_is_released_when_its_key_up_was_missed()
+    {
+        using var capture = new InputCapture();
+        capture.SetPassThrough(false);
+        var modifiers = KeyModifiers.None;
+        capture.KeyboardReport += (value, _) => modifiers = value;
+
+        capture.HandleKeyboardEvent(LeftControl, true);
+        Assert.Equal(KeyModifiers.LeftControl, modifiers);
+
+        capture.SetKeyStateProbe(_ => false);
+        capture.ResyncHeldState();
+        Assert.Equal(KeyModifiers.None, modifiers);
+    }
+
+    [Theory]
+    [InlineData(0x31, 0)]
+    [InlineData(0x35, 4)]
+    [InlineData(0x39, 8)]
+    public void Ctrl_alt_digit_selects_a_host_directly_and_only_once(int digit, int expectedIndex)
+    {
+        using var capture = new InputCapture();
+        capture.SetPassThrough(true);
+        var selected = new List<int>();
+        capture.SelectHostRequested += selected.Add;
+        capture.HandleKeyboardEvent(LeftControl, true);
+        capture.HandleKeyboardEvent(LeftAlt, true);
+
+        Assert.True(capture.HandleKeyboardEvent(digit, true));
+        Assert.True(capture.HandleKeyboardEvent(digit, true)); // auto-repeat
+        capture.HandleKeyboardEvent(digit, false);
+
+        Assert.Equal(new[] { expectedIndex }, selected);
+    }
+
+    [Fact]
+    public void Ctrl_alt_zero_returns_input_to_this_pc()
+    {
+        using var capture = new InputCapture();
+        capture.SetPassThrough(false);
+        var selected = 0;
+        var locals = 0;
+        capture.SelectHostRequested += _ => selected++;
+        capture.SelectLocalRequested += () => locals++;
+        capture.HandleKeyboardEvent(LeftControl, true);
+        capture.HandleKeyboardEvent(LeftAlt, true);
+
+        Assert.True(capture.HandleKeyboardEvent(0x30, true));
+
+        Assert.Equal(1, locals);
+        Assert.Equal(0, selected);
+    }
+
+    [Fact]
+    public void Direct_host_selection_releases_held_keys_before_switching()
+    {
+        using var capture = new InputCapture();
+        capture.SetPassThrough(false);
+        var events = new List<string>();
+        capture.KeyboardReport += (_, usages) =>
+        {
+            if (usages.Length == 0) events.Add("release");
+        };
+        capture.SelectHostRequested += _ => events.Add("select");
+
+        capture.HandleKeyboardEvent(0x41, true);
+        capture.HandleKeyboardEvent(LeftControl, true);
+        capture.HandleKeyboardEvent(LeftAlt, true);
+        capture.HandleKeyboardEvent(0x32, true); // Ctrl+Alt+2
+
+        Assert.Equal(new[] { "release", "select" }, events);
+    }
+
+    [Fact]
+    public void A_digit_without_both_modifiers_is_typed_normally()
+    {
+        using var capture = new InputCapture();
+        capture.SetPassThrough(false);
+        var reports = new List<byte[]>();
+        var selected = 0;
+        capture.KeyboardReport += (_, usages) => reports.Add(usages);
+        capture.SelectHostRequested += _ => selected++;
+
+        capture.HandleKeyboardEvent(0x31, true);
+
+        Assert.Equal(new byte[] { 0x1E }, reports[^1]);
+        Assert.Equal(0, selected);
+    }
+
     [Theory]
     [InlineData(MouseButtons.Left)]
     [InlineData(MouseButtons.Right)]

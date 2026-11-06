@@ -29,6 +29,18 @@ public sealed class AppSettings : INotifyPropertyChanged
         set { if (Set(ref _startPeripheralOnLaunch, value)) Save(); }
     }
 
+    private bool _logKeyDiagnostics;
+    /// <summary>
+    /// Logs each captured key with its virtual key, scan code and resulting HID usages. The
+    /// host-side symptom of a mapping or delivery problem is silent, so this is the only way
+    /// to see which side lost a key.
+    /// </summary>
+    public bool LogKeyDiagnostics
+    {
+        get => _logKeyDiagnostics;
+        set { if (Set(ref _logKeyDiagnostics, value)) Save(); }
+    }
+
     private static AppSettings Load()
     {
         try

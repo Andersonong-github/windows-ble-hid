@@ -69,7 +69,9 @@ Console.WriteLine($"""
       quit                 exit
 
     While capturing:
-      Ctrl+Alt+CapsLock     switch target (Ctrl+D+C also works)
+      Ctrl+Alt+CapsLock     cycle target (Ctrl+D+C also works)
+      Ctrl+Alt+1..9         select host 1-9 directly
+      Ctrl+Alt+0            return input to this PC
 
     Background mode (keeps hosts bonded across restarts):
       --background         run detached, no console; same capture shortcuts
